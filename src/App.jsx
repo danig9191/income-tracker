@@ -1,32 +1,6 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
+import { usePlaidLink } from "react-plaid-link";
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from "recharts";
-
-const ZELLE_SENDERS = [
-  "Mike Johnson", "Sarah Chen", "David Rodriguez", "Kevin Park",
-  "Anthony Russo", "James Williams", "Carlos Mendez", "Tyler Brown",
-  "Malik Thompson", "Danny Ortiz", "Chris Lee", "Marcus Green"
-];
-
-const FAKE_TRANSACTIONS = (() => {
-  const txns = [];
-  const now = new Date();
-  for (let i = 364; i >= 0; i--) {
-    const date = new Date(now);
-    date.setDate(date.getDate() - i);
-    const dateStr = date.toISOString().split("T")[0];
-    const count = Math.random() < 0.35 ? (Math.random() < 0.3 ? 2 : 1) : 0;
-    for (let c = 0; c < count; c++) {
-      const sender = ZELLE_SENDERS[Math.floor(Math.random() * ZELLE_SENDERS.length)];
-      txns.push({
-        date: dateStr,
-        amount: Math.round((Math.random() * 1200 + 150) * 100) / 100,
-        sender,
-        initials: sender.split(" ").map(w => w[0]).join(""),
-      });
-    }
-  }
-  return txns;
-})();
 
 const fmt = (n) => "$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const fmtShort = (n) => n >= 1000 ? "$" + (n / 1000).toFixed(1) + "k" : fmt(n);
@@ -81,12 +55,94 @@ function senderColor(name) {
   return SENDER_COLORS[Math.abs(h) % SENDER_COLORS.length];
 }
 
+function getInitials(name) {
+  return name.split(" ").map(w => w[0]).join("").slice(0, 2).toUpperCase();
+}
+
+function ConnectScreen({ onConnect }) {
+  return (
+    <div style={{ minHeight: "100vh", background: "#080808", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24, fontFamily: "'DM Sans', sans-serif" }}>
+      <style>{`@import url('https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600&family=DM+Mono:wght@400;500&family=Bebas+Neue&display=swap');`}</style>
+      <div style={{ fontSize: 10, letterSpacing: "0.16em", color: "#00e5a0", fontFamily: "'Bebas Neue'", marginBottom: 8 }}>CAPITAL ONE · ZELLE</div>
+      <div style={{ fontFamily: "'Bebas Neue'", fontSize: 48, color: "#fff", marginBottom: 8 }}>MONEY IN</div>
+      <div style={{ color: "#444", fontSize: 13, marginBottom: 40, textAlign: "center" }}>Connect your bank to see your real income</div>
+      <button onClick={onConnect} style={{
+        background: "#00e5a0", color: "#080808", border: "none", borderRadius: 14,
+        padding: "16px 32px", fontSize: 15, fontWeight: 700, cursor: "pointer",
+        fontFamily: "'DM Sans'", letterSpacing: "0.02em"
+      }}>
+        Connect Capital One
+      </button>
+      <div style={{ color: "#2a2a2a", fontSize: 10, marginTop: 20, textAlign: "center" }}>
+        Secured by Plaid · Your credentials are never stored
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
+  const [linkToken, setLinkToken] = useState(null);
+  const [accessToken, setAccessToken] = useState(() => localStorage.getItem("plaid_access_token"));
+  const [transactions, setTransactions] = useState([]);
+  const [loading, setLoading] = useState(false);
   const [mode, setMode] = useState("monthly");
   const [animKey, setAnimKey] = useState(0);
   const [excluded, setExcluded] = useState(new Set());
 
-  const activeTxns = FAKE_TRANSACTIONS.filter((_, i) => !excluded.has(i));
+  // Fetch link token on load
+  useEffect(() => {
+    if (!accessToken) {
+      fetch("/api/create-link-token")
+        .then(r => r.json())
+        .then(data => setLinkToken(data.link_token));
+    }
+  }, [accessToken]);
+
+  // Fetch transactions when access token is available
+  useEffect(() => {
+    if (accessToken) {
+      setLoading(true);
+      fetch("/api/get-transactions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ access_token: accessToken }),
+      })
+        .then(r => r.json())
+        .then(data => {
+          const zelle = (data.transactions || [])
+            .filter(t => t.amount < 0 && (
+              t.name.toLowerCase().includes("zelle") ||
+              t.payment_channel === "other"
+            ))
+            .map((t, i) => ({
+              date: t.date,
+              amount: Math.abs(t.amount),
+              sender: t.name.replace(/zelle/i, "").replace(/payment from/i, "").trim() || "Unknown",
+              i,
+            }))
+            .map(t => ({ ...t, initials: getInitials(t.sender) }));
+          setTransactions(zelle);
+          setLoading(false);
+        });
+    }
+  }, [accessToken]);
+
+  const onSuccess = useCallback((public_token) => {
+    fetch("/api/exchange-token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ public_token }),
+    })
+      .then(r => r.json())
+      .then(data => {
+        localStorage.setItem("plaid_access_token", data.access_token);
+        setAccessToken(data.access_token);
+      });
+  }, []);
+
+  const { open, ready } = usePlaidLink({ token: linkToken, onSuccess });
+
+  const activeTxns = transactions.filter((_, i) => !excluded.has(i));
   const toggleExclude = (i) => setExcluded((prev) => {
     const next = new Set(prev);
     next.has(i) ? next.delete(i) : next.add(i);
@@ -109,12 +165,20 @@ export default function App() {
   const thisMonth = activeTxns.filter(t => t.date.startsWith(ym)).reduce((s, t) => s + t.amount, 0);
   const thisYear  = activeTxns.reduce((s, t) => s + t.amount, 0);
 
-  const recentTxns = FAKE_TRANSACTIONS.map((t, i) => ({ ...t, i })).reverse().slice(0, 12);
+  const recentTxns = [...transactions].reverse().slice(0, 12);
 
   useEffect(() => { setAnimKey(k => k + 1); }, [mode]);
 
   const modes = ["daily", "weekly", "monthly", "yearly"];
   const modeLabels = { daily: "Day", weekly: "Week", monthly: "Month", yearly: "Year" };
+
+  if (!accessToken) return <ConnectScreen onConnect={() => ready && open()} />;
+
+  if (loading) return (
+    <div style={{ minHeight: "100vh", background: "#080808", display: "flex", alignItems: "center", justifyContent: "center", color: "#00e5a0", fontFamily: "'DM Mono', monospace", fontSize: 13 }}>
+      Loading your transactions...
+    </div>
+  );
 
   return (
     <div style={{ minHeight: "100vh", background: "#080808", color: "#e8e8e8", fontFamily: "'DM Sans', sans-serif", maxWidth: 430, margin: "0 auto" }}>
@@ -132,27 +196,20 @@ export default function App() {
         .chart-anim { animation: fadeUp 0.3s ease both; }
       `}</style>
 
-      {/* Header */}
       <div style={{ padding: "48px 16px 16px", background: "linear-gradient(180deg, #0c0c0c 0%, #080808 100%)" }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 18 }}>
           <div>
-            <div style={{ fontSize: 10, letterSpacing: "0.16em", color: "#00e5a0", fontFamily: "'Bebas Neue'", marginBottom: 3 }}>
-              CAPITAL ONE · ZELLE
-            </div>
-            <div style={{ fontFamily: "'Bebas Neue'", fontSize: 34, letterSpacing: "0.02em", color: "#fff", lineHeight: 1 }}>
-              MONEY IN
-            </div>
+            <div style={{ fontSize: 10, letterSpacing: "0.16em", color: "#00e5a0", fontFamily: "'Bebas Neue'", marginBottom: 3 }}>CAPITAL ONE · ZELLE</div>
+            <div style={{ fontFamily: "'Bebas Neue'", fontSize: 34, letterSpacing: "0.02em", color: "#fff", lineHeight: 1 }}>MONEY IN</div>
           </div>
-          <div style={{ width: 38, height: 38, borderRadius: "50%", background: "#0f0f0f", border: "1px solid #1a1a1a", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16 }}>
-            ⚡
-          </div>
+          <button onClick={() => { localStorage.removeItem("plaid_access_token"); setAccessToken(null); setTransactions([]); }}
+            style={{ background: "none", border: "1px solid #1a1a1a", borderRadius: 8, color: "#333", fontSize: 10, cursor: "pointer", padding: "6px 10px", fontFamily: "'DM Sans'" }}>
+            Disconnect
+          </button>
         </div>
 
-        {/* Hero card */}
         <div style={{ background: "#0d0d0d", border: "1px solid #1a1a1a", borderRadius: 18, padding: "18px", marginBottom: 10 }}>
-          <div style={{ fontSize: 10, color: "#444", letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: 5 }}>
-            This Month
-          </div>
+          <div style={{ fontSize: 10, color: "#444", letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: 5 }}>This Month</div>
           <div style={{ fontFamily: "'DM Mono'", fontSize: 40, fontWeight: 500, color: "#00e5a0", letterSpacing: "-0.02em", lineHeight: 1 }}>
             {fmt(thisMonth)}
           </div>
@@ -161,32 +218,21 @@ export default function App() {
           </div>
         </div>
 
-        {/* 4 mini stats */}
         <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8 }}>
-          {[
-            { label: "Today", val: today },
-            { label: "Week", val: thisWeek },
-            { label: "Month", val: thisMonth },
-            { label: "Year", val: thisYear },
-          ].map(({ label, val }) => (
+          {[{ label: "Today", val: today }, { label: "Week", val: thisWeek }, { label: "Month", val: thisMonth }, { label: "Year", val: thisYear }].map(({ label, val }) => (
             <div key={label} style={{ background: "#0d0d0d", border: "1px solid #1a1a1a", borderRadius: 14, padding: "11px 8px" }}>
               <div style={{ fontSize: 9, color: "#3a3a3a", letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 5 }}>{label}</div>
-              <div style={{ fontFamily: "'DM Mono'", fontSize: 13, fontWeight: 500, color: val > 0 ? "#d4d4d4" : "#2a2a2a" }}>
-                {fmtShort(val)}
-              </div>
+              <div style={{ fontFamily: "'DM Mono'", fontSize: 13, fontWeight: 500, color: val > 0 ? "#d4d4d4" : "#2a2a2a" }}>{fmtShort(val)}</div>
             </div>
           ))}
         </div>
       </div>
 
-      {/* Chart */}
       <div style={{ padding: "10px 16px 0" }}>
         <div style={{ background: "#0d0d0d", border: "1px solid #1a1a1a", borderRadius: 18, padding: "14px 12px 12px" }}>
           <div style={{ display: "flex", background: "#111", borderRadius: 14, padding: "3px", marginBottom: 14, gap: 2 }}>
             {modes.map(m => (
-              <button key={m} className={`mode-pill ${mode === m ? "active" : ""}`} onClick={() => setMode(m)}>
-                {modeLabels[m]}
-              </button>
+              <button key={m} className={`mode-pill ${mode === m ? "active" : ""}`} onClick={() => setMode(m)}>{modeLabels[m]}</button>
             ))}
           </div>
           <div className="chart-anim" key={animKey} style={{ height: 150 }}>
@@ -209,7 +255,6 @@ export default function App() {
         </div>
       </div>
 
-      {/* Transactions list */}
       <div style={{ padding: "14px 16px 40px" }}>
         <div style={{ background: "#0d0d0d", border: "1px solid #1a1a1a", borderRadius: 18, overflow: "hidden" }}>
           <div style={{ padding: "13px 16px 11px", display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: "1px solid #111" }}>
@@ -220,27 +265,20 @@ export default function App() {
               </button>
             )}
           </div>
-
-          {recentTxns.map(({ i, ...t }) => {
-            const isExcluded = excluded.has(i);
+          {recentTxns.length === 0 && (
+            <div style={{ padding: 24, textAlign: "center", color: "#333", fontSize: 12 }}>No Zelle payments found</div>
+          )}
+          {recentTxns.map((t) => {
+            const isExcluded = excluded.has(t.i);
             const color = senderColor(t.sender);
             return (
-              <div key={i} className="txn-row" style={{ opacity: isExcluded ? 0.28 : 1, transition: "opacity 0.2s" }}>
-                {/* Avatar */}
+              <div key={t.i} className="txn-row" style={{ opacity: isExcluded ? 0.28 : 1, transition: "opacity 0.2s" }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 11, flex: 1, minWidth: 0 }}>
-                  <div style={{
-                    width: 40, height: 40, borderRadius: "50%",
-                    background: color + "1a", border: `1.5px solid ${color}33`,
-                    display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0
-                  }}>
+                  <div style={{ width: 40, height: 40, borderRadius: "50%", background: color + "1a", border: `1.5px solid ${color}33`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
                     <span style={{ fontSize: 12, fontWeight: 700, color, fontFamily: "'DM Mono'" }}>{t.initials}</span>
                   </div>
                   <div style={{ minWidth: 0 }}>
-                    <div style={{
-                      fontSize: 14, color: isExcluded ? "#3a3a3a" : "#d4d4d4",
-                      fontWeight: 500, textDecoration: isExcluded ? "line-through" : "none",
-                      whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis"
-                    }}>
+                    <div style={{ fontSize: 14, color: isExcluded ? "#3a3a3a" : "#d4d4d4", fontWeight: 500, textDecoration: isExcluded ? "line-through" : "none", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                       {t.sender}
                     </div>
                     <div style={{ fontSize: 10, color: "#2e2e2e", marginTop: 2, fontFamily: "'DM Mono'" }}>
@@ -248,27 +286,18 @@ export default function App() {
                     </div>
                   </div>
                 </div>
-
                 <div style={{ display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
-                  <div style={{
-                    fontFamily: "'DM Mono'", fontSize: 15, fontWeight: 500,
-                    color: isExcluded ? "#2e2e2e" : "#00e5a0",
-                    textDecoration: isExcluded ? "line-through" : "none"
-                  }}>
+                  <div style={{ fontFamily: "'DM Mono'", fontSize: 15, fontWeight: 500, color: isExcluded ? "#2e2e2e" : "#00e5a0", textDecoration: isExcluded ? "line-through" : "none" }}>
                     +{fmt(t.amount)}
                   </div>
-                  <button className="x-btn" onClick={() => toggleExclude(i)}>
-                    {isExcluded
-                      ? <span style={{ fontSize: 13, color: "#444" }}>↩</span>
-                      : <span style={{ fontSize: 18, color: "#333", lineHeight: 1 }}>×</span>
-                    }
+                  <button className="x-btn" onClick={() => toggleExclude(t.i)}>
+                    {isExcluded ? <span style={{ fontSize: 13, color: "#444" }}>↩</span> : <span style={{ fontSize: 18, color: "#333", lineHeight: 1 }}>×</span>}
                   </button>
                 </div>
               </div>
             );
           })}
         </div>
-        <div style={{ textAlign: "center", marginTop: 20, fontSize: 10, color: "#1a1a1a", letterSpacing: "0.08em" }}>DEMO · FAKE DATA</div>
       </div>
     </div>
   );
